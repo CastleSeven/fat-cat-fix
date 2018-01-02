@@ -5,22 +5,28 @@
 #include <DNSServer.h>
 #include <Adafruit_ssd1306syp.h>
 #include <Wire.h>
+#include <EEPROM.h>
+#include <config.h>
 
+#define EEPROM_SCHEMA 0xbb
+#define EEPROM_TIME_ADDR 1
 
 #define SDA_PIN D2
 #define SCL_PIN D1
 #define UTC_OFFSET -6
 
-char ssid[] = "blackdiamond";
-char pass[] = "$a112304%B061111";
+#define DEFAULT_FEEDING_TIME "17:30"
+#define DEFAULT_FEEDING_AMOUNT "2"
+
+
 const char* host = "time.nist.gov";
 
 unsigned long previousLoopTime = 0;
 unsigned int loopDelay = 30000;
 
 String Argument_Name;
-String clientTimeAsString = "0:00";
-String clientAmountAsString = "1";
+String clientTimeAsString = DEFAULT_FEEDING_TIME;
+String clientAmountAsString = DEFAULT_FEEDING_AMOUNT;
 bool requestDisplayUpdate = true;
 
 ESP8266WebServer server(80);
@@ -45,19 +51,57 @@ void setup(){
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
 
-  display.clear();
-  display.setCursor(0,0);
-  display.setTextSize(2);
-  display.setTextColor(WHITE);
-  display.println("Local IP:");
-  display.println(WiFi.localIP());
-  delay(50);
+  short schema;
+  EEPROM.begin(512);
+  schema = EEPROM.read(0);
+  Serial.println("SCHEMA = " + schema);
+  if(schema != EEPROM_SCHEMA) {
+    Serial.println("SCHEMA not found, initializing EEPROM with default values");
+    schema = EEPROM_SCHEMA;
+    EEPROM.write(0, schema);
+    char timeBuffer[5];
+    clientTimeAsString.toCharArray(timeBuffer, sizeof(timeBuffer));
+    for(int i = 0; i < 5; i++) {
+      EEPROM.write(EEPROM_TIME_ADDR+i, timeBuffer[i]);
+    }
+    char amountBuffer[1];
+    clientAmountAsString.toCharArray(amountBuffer, sizeof(amountBuffer));
+    EEPROM.write(EEPROM_TIME_ADDR+5, amountBuffer[0]);
+    EEPROM.commit();
+  } else {
+    char timeBuffer[6];
+    for(int i = 0; i < 5; i++) {
+      timeBuffer[i] = EEPROM.read(EEPROM_TIME_ADDR+i);
+    }
+    timeBuffer[5] = '\0';
+    char amountBuffer[2];
+    amountBuffer[0] = EEPROM.read(EEPROM_TIME_ADDR+5);
+    amountBuffer[1] = '\0';
+    Serial.println("EEPROM Time: " + String(timeBuffer) + " EEPROM Amount: " + String(amountBuffer));
+  }
+  EEPROM.end();
 
   // Start the server
   server.begin();
   server.on("/", HandleClient);
   server.on("/result", ShowClientResponse);
   Serial.println("Server started");
+
+}
+
+void storeEEPROMValues() {
+  Serial.println("Storing new values in EEPROM");
+  EEPROM.begin(512);
+  char timeBuffer[5];
+  clientTimeAsString.toCharArray(timeBuffer, sizeof(timeBuffer));
+  for(int i = 0; i < 5; i++) {
+    EEPROM.write(EEPROM_TIME_ADDR+i, timeBuffer[i]);
+  }
+  char amountBuffer[1];
+  clientAmountAsString.toCharArray(amountBuffer, sizeof(amountBuffer));
+  EEPROM.write(EEPROM_TIME_ADDR+5, amountBuffer[0]);
+  EEPROM.commit();
+  EEPROM.end();
 }
 
 void HandleClient() {
@@ -71,15 +115,35 @@ void HandleClient() {
    webpage += "<body>";
     webpage += "<h1><br>ESP8266 Server - Getting input from a client</h1>";
     webpage += "<h2><br>Currently Set Feeding Time: "+clientTimeAsString+"</h2>";
-    webpage += "<h2><br>Currently Set Feeding Amount (cups): "+clientAmountAsString+"</h2>";
+    webpage += "<h2><br>Currently Set Feeding Amount (&frac14; cups): "+clientAmountAsString+"</h2>";
     String IPaddress = WiFi.localIP().toString();
-    webpage += "<form action='http://"+IPaddress+"' method='POST'>";
-     webpage += "&nbsp;&nbsp;&nbsp;&nbsp;Feeding Time:<input type='text' name='time_input'><BR>";
-     webpage += "Amount to feed (in cups):<input type='text' name='amount_input'>&nbsp;<input type='submit' value='Enter'>"; // omit <input type='submit' value='Enter'> for just 'enter'
+    webpage += "<form action='http://"+IPaddress+"/result' method='POST'>";
+     webpage += "Feeding Time:<input type='text' name='time_input'><BR>";
+     webpage += "Amount to feed (in &frac14;, e.g., enter \"4\" to feed 4 quarters, or 1 cup):<input type='text' name='amount_input'>&nbsp;<input type='submit' value='Enter'>"; // omit <input type='submit' value='Enter'> for just 'enter'
     webpage += "</form>";
    webpage += "</body>";
   webpage += "</html>";
   server.send(200, "text/html", webpage); // Send a response to the client asking for input
+}
+
+bool validateClientInput() {
+  bool valid = true;
+  if(clientTimeAsString.length() != 5 || clientTimeAsString.charAt(2) != ':') {
+    Serial.println("Time must be of format XX:XX!");
+    clientTimeAsString = DEFAULT_FEEDING_TIME;
+    valid = false;
+  }
+  if(clientAmountAsString.toInt() == 0 || clientAmountAsString.length() > 1) {
+    Serial.println("Amount must be a non-zero integer from 1 - 9!");
+    clientAmountAsString = DEFAULT_FEEDING_AMOUNT;
+    valid = false;
+  }
+
+  return valid;
+}
+
+void ShowClientResponse() {
+  bool validInput = false;
   if (server.args() > 0 ) { // Arguments were received
     for ( uint8_t i = 0; i < server.args(); i++ ) {
       Serial.print(server.argName(i)); // Display the argument
@@ -99,51 +163,62 @@ void HandleClient() {
         // e.g. range_maximum = server.arg(i).toFloat(); // use string.toFloat() if you wanted to convert the input to a floating point number
       }
     }
+    validInput = validateClientInput();
+    if(validInput) {
+      storeEEPROMValues();
+    }
+
     requestDisplayUpdate = true;
   }
-}
-
-void ShowClientResponse() {
   String webpage;
   webpage =  "<html>";
-   webpage += "<head><title>ESP8266 Input Example</title>";
+  webpage += "<meta http-equiv=\"refresh\" content=\"5;url=http://"+WiFi.localIP().toString()+"/\" />";
+   webpage += "<head><title>Fat Cat Fix - Data Received!</title>";
     webpage += "<style>";
      webpage += "body { background-color: #E6E6FA; font-family: Arial, Helvetica, Sans-Serif; Color: blue;}";
     webpage += "</style>";
    webpage += "</head>";
    webpage += "<body>";
-    webpage += "<h1><br>ESP8266 Server - This was what the client sent</h1>";
-    webpage += "<p>Name received was: " + clientTimeAsString + "</p>";
-    webpage += "<p>Address received was: " + clientAmountAsString + "</p>";
+    if(validInput) {
+      webpage += "<h1><br>Fat Cat Fix - Data Received!</h1>";
+    }
+    else {
+      webpage += "<h1><br>Oops! Looks like there was something wrong with your input. Using default values...</h1>";
+    }
+    webpage += "<p>New Feeding Time: " + clientTimeAsString + "</p>";
+    webpage += "<p>New Amount (quarter cups): " + clientAmountAsString + "</p>";
    webpage += "</body>";
   webpage += "</html>";
-  server.send(200, "text/html", webpage); // Send a response to the client asking for input
+  server.send(200, "text/html", webpage);
 }
 
 void blink(){
-  display.clear();
-  display.setCursor(0,0);
-  display.setTextSize(2);
-  display.setTextColor(WHITE);
-  display.println("");
-  display.setTextSize(4);
-  display.println("=- -=");
-  display.setTextSize(4);
-  display.setCursor(0,30);
-  display.println("  -  ");
-  display.update();
-  delay(50);
-  display.clear();
-  display.setCursor(0,0);
-  display.setTextSize(2);
-  display.setTextColor(WHITE);
-  display.println("");
-  display.setTextSize(4);
-  display.println("=^ ^=");
-  display.setTextSize(4);
-  display.setCursor(0,30);
-  display.println("  -  ");
-  display.update();
+    for(int i = 0; i < 3; i++) {
+      display.clear();
+      display.setCursor(0,0);
+      display.setTextSize(2);
+      display.setTextColor(WHITE);
+      display.println("");
+      display.setTextSize(4);
+      display.println("=- -=");
+      display.setTextSize(4);
+      display.setCursor(0,30);
+      display.println("  -  ");
+      display.update();
+      delay(50);
+      display.clear();
+      display.setCursor(0,0);
+      display.setTextSize(2);
+      display.setTextColor(WHITE);
+      display.println("");
+      display.setTextSize(4);
+      display.println("=^ ^=");
+      display.setTextSize(4);
+      display.setCursor(0,30);
+      display.println("  -  ");
+      display.update();
+      delay(2000);
+  }
 }
 
 String getUTCTime() {
@@ -174,10 +249,6 @@ String getUTCTime() {
       //  time starts at pos 14
       dateTime = line.substring(7, 24);
       Serial.println(dateTime);
-      // dateTime.toCharArray(buffer, 10);
-      // dateTime = line.substring(16, 24);
-      // Serial.println(dateTime);
-      // dateTime.toCharArray(buffer, 10);
     }
   }
   return dateTime;
