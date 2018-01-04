@@ -8,11 +8,19 @@
 #include <EEPROM.h>
 #include <config.h>
 
-#define EEPROM_SCHEMA 0xbb
+#define EEPROM_SCHEMA 0xaa
 #define EEPROM_TIME_ADDR 1
 
 #define SDA_PIN D2
 #define SCL_PIN D1
+#define L9110S_B_IA D5
+#define L9110S_B_IB D6
+#define MOTOR_B_PWM L9110S_B_IA
+#define MOTOR_B_DIR L9110S_B_IB
+#define DIR_DELAY 1000
+#define PWM_SPEED 255
+#define MS_TO_DISPENSE_QUARTER_CUP 7000
+
 #define UTC_OFFSET -6
 
 #define DEFAULT_FEEDING_TIME "17:30"
@@ -23,10 +31,12 @@ const char* host = "time.nist.gov";
 
 unsigned long previousLoopTime = 0;
 unsigned int loopDelay = 30000;
+unsigned int oneMinute = 60000;
+unsigned long lastFeedingTime = 0;
 
 String Argument_Name;
-String clientTimeAsString = DEFAULT_FEEDING_TIME;
-String clientAmountAsString = DEFAULT_FEEDING_AMOUNT;
+char rawClientTime[] = DEFAULT_FEEDING_TIME;
+char rawClientAmount[] = DEFAULT_FEEDING_AMOUNT;
 bool requestDisplayUpdate = true;
 
 ESP8266WebServer server(80);
@@ -35,6 +45,10 @@ Adafruit_ssd1306syp display(SDA_PIN,SCL_PIN);
 
 void HandleClient();
 void ShowClientResponse();
+void ClientFeedNow();
+void blink();
+unsigned int convertCArrayToInt(char array[]);
+void feed(unsigned int quarterCupsToFeed);
 
 void setup(){
   Serial.begin(115200);
@@ -45,6 +59,9 @@ void setup(){
     delay(500);
     Serial.print(".");
   }
+
+  pinMode(MOTOR_B_PWM, OUTPUT);
+  pinMode(MOTOR_B_DIR, OUTPUT);
 
   Serial.println("");
   Serial.println("WiFi connected");
@@ -57,27 +74,34 @@ void setup(){
   Serial.println("SCHEMA = " + schema);
   if(schema != EEPROM_SCHEMA) {
     Serial.println("SCHEMA not found, initializing EEPROM with default values");
+    for (int i = 0 ; i < 512 ; i++) {
+      EEPROM.write(i, 0xFF);
+    }
     schema = EEPROM_SCHEMA;
     EEPROM.write(0, schema);
-    char timeBuffer[5];
-    clientTimeAsString.toCharArray(timeBuffer, sizeof(timeBuffer));
-    for(int i = 0; i < 5; i++) {
-      EEPROM.write(EEPROM_TIME_ADDR+i, timeBuffer[i]);
-    }
-    char amountBuffer[1];
-    clientAmountAsString.toCharArray(amountBuffer, sizeof(amountBuffer));
-    EEPROM.write(EEPROM_TIME_ADDR+5, amountBuffer[0]);
+
+    int i = 0;
+    do {
+      EEPROM.write(EEPROM_TIME_ADDR+i, rawClientTime[i]);
+      i++;
+    } while(rawClientTime[i - 1]);
+
+    i = 0;
+    do{
+      EEPROM.write(EEPROM_TIME_ADDR+sizeof(rawClientTime)+i, rawClientAmount[i]);
+      i++;
+    } while(rawClientAmount[i - 1]);
+
     EEPROM.commit();
   } else {
-    char timeBuffer[6];
-    for(int i = 0; i < 5; i++) {
-      timeBuffer[i] = EEPROM.read(EEPROM_TIME_ADDR+i);
+    for(int i = 0; i < sizeof(rawClientTime); i++) {
+      rawClientTime[i] = EEPROM.read(EEPROM_TIME_ADDR+i);
     }
-    timeBuffer[5] = '\0';
-    char amountBuffer[2];
-    amountBuffer[0] = EEPROM.read(EEPROM_TIME_ADDR+5);
-    amountBuffer[1] = '\0';
-    Serial.println("EEPROM Time: " + String(timeBuffer) + " EEPROM Amount: " + String(amountBuffer));
+    for(int i = 0; i < sizeof(rawClientAmount); i++) {
+      rawClientAmount[i] = EEPROM.read(EEPROM_TIME_ADDR+sizeof(rawClientTime)+i);
+    }
+
+    Serial.println("EEPROM Time: " + String(rawClientTime) + " EEPROM Amount: " + String(rawClientAmount));
   }
   EEPROM.end();
 
@@ -85,6 +109,7 @@ void setup(){
   server.begin();
   server.on("/", HandleClient);
   server.on("/result", ShowClientResponse);
+  server.on("/feednow", ClientFeedNow);
   Serial.println("Server started");
 
 }
@@ -92,14 +117,14 @@ void setup(){
 void storeEEPROMValues() {
   Serial.println("Storing new values in EEPROM");
   EEPROM.begin(512);
-  char timeBuffer[5];
-  clientTimeAsString.toCharArray(timeBuffer, sizeof(timeBuffer));
-  for(int i = 0; i < 5; i++) {
-    EEPROM.write(EEPROM_TIME_ADDR+i, timeBuffer[i]);
+  for(int i = 0; i < sizeof(rawClientTime); i++) {
+    EEPROM.write(EEPROM_TIME_ADDR+i, rawClientTime[i]);
   }
-  char amountBuffer[1];
-  clientAmountAsString.toCharArray(amountBuffer, sizeof(amountBuffer));
-  EEPROM.write(EEPROM_TIME_ADDR+5, amountBuffer[0]);
+  for(int i = 0; i < sizeof(rawClientAmount); i++) {
+    EEPROM.write(EEPROM_TIME_ADDR+i+sizeof(rawClientTime), rawClientAmount[i]);
+    Serial.println();
+
+  }
   EEPROM.commit();
   EEPROM.end();
 }
@@ -113,14 +138,19 @@ void HandleClient() {
     webpage += "</style>";
    webpage += "</head>";
    webpage += "<body>";
-    webpage += "<h1><br>ESP8266 Server - Getting input from a client</h1>";
-    webpage += "<h2><br>Currently Set Feeding Time: "+clientTimeAsString+"</h2>";
-    webpage += "<h2><br>Currently Set Feeding Amount (&frac14; cups): "+clientAmountAsString+"</h2>";
+    webpage += "<h1><br>Fat Cat Fix - Scheduling</h1>";
+    webpage += "<h2><br>Currently Set Feeding Time: ";
+    webpage.concat(rawClientTime);
+    webpage += "</h2>";
+    webpage += "<h2><br>Currently Set Feeding Amount (&frac14; cups): ";
+    webpage.concat(rawClientAmount);
+    webpage += "</h2>";
     String IPaddress = WiFi.localIP().toString();
     webpage += "<form action='http://"+IPaddress+"/result' method='POST'>";
      webpage += "Feeding Time:<input type='text' name='time_input'><BR>";
      webpage += "Amount to feed (in &frac14;, e.g., enter \"4\" to feed 4 quarters, or 1 cup):<input type='text' name='amount_input'>&nbsp;<input type='submit' value='Enter'>"; // omit <input type='submit' value='Enter'> for just 'enter'
-    webpage += "</form>";
+    webpage += "</form><BR><BR><BR>";
+    webpage += "<form action='http://"+IPaddress+"/feednow' method='POST'><input type='submit' value='Feed Now!'></form>";
    webpage += "</body>";
   webpage += "</html>";
   server.send(200, "text/html", webpage); // Send a response to the client asking for input
@@ -128,18 +158,38 @@ void HandleClient() {
 
 bool validateClientInput() {
   bool valid = true;
-  if(clientTimeAsString.length() != 5 || clientTimeAsString.charAt(2) != ':') {
+  if(strlen(rawClientTime) != 5 || rawClientTime[2] != ':') {
     Serial.println("Time must be of format XX:XX!");
-    clientTimeAsString = DEFAULT_FEEDING_TIME;
+    strcpy(rawClientTime, DEFAULT_FEEDING_TIME);
     valid = false;
   }
-  if(clientAmountAsString.toInt() == 0 || clientAmountAsString.length() > 1) {
+  if(rawClientAmount[0] == '0' || strlen(rawClientAmount) > 1 || !isdigit(rawClientAmount[0])) {
     Serial.println("Amount must be a non-zero integer from 1 - 9!");
-    clientAmountAsString = DEFAULT_FEEDING_AMOUNT;
+    strcpy(rawClientAmount, DEFAULT_FEEDING_AMOUNT);
     valid = false;
   }
 
   return valid;
+}
+
+void ClientFeedNow() {
+  String webpage;
+  webpage =  "<html>";
+  webpage += "<meta http-equiv=\"refresh\" content=\"3;url=http://"+WiFi.localIP().toString()+"/\" />";
+   webpage += "<head><title>Fat Cat Fix - Feed Now!</title>";
+    webpage += "<style>";
+     webpage += "body { background-color: #E6E6FA; font-family: Arial, Helvetica, Sans-Serif; Color: blue;}";
+    webpage += "</style>";
+   webpage += "</head>";
+   webpage += "<body>";
+   webpage += "<h1><br>Feeding ";
+   webpage.concat(rawClientAmount);
+  webpage += " quarter cups now!</h1>";
+   webpage += "</body>";
+  webpage += "</html>";
+  server.send(200, "text/html", webpage);
+  unsigned int quarterCups = convertCArrayToInt(rawClientAmount);
+  feed(quarterCups);
 }
 
 void ShowClientResponse() {
@@ -151,14 +201,14 @@ void ShowClientResponse() {
       if (server.argName(i) == "time_input") {
         Serial.print(" Input received was: ");
         Serial.println(server.arg(i));
-        clientTimeAsString = server.arg(i);
+        server.arg(i).toCharArray(rawClientTime, sizeof(rawClientTime));
         // e.g. range_maximum = server.arg(i).toInt();   // use string.toInt()   if you wanted to convert the input to an integer number
         // e.g. range_maximum = server.arg(i).toFloat(); // use string.toFloat() if you wanted to convert the input to a floating point number
       }
       if (server.argName(i) == "amount_input") {
         Serial.print(" Input received was: ");
         Serial.println(server.arg(i));
-        clientAmountAsString = server.arg(i);
+        server.arg(i).toCharArray(rawClientAmount, sizeof(rawClientAmount));
         // e.g. range_maximum = server.arg(i).toInt();   // use string.toInt()   if you wanted to convert the input to an integer number
         // e.g. range_maximum = server.arg(i).toFloat(); // use string.toFloat() if you wanted to convert the input to a floating point number
       }
@@ -185,8 +235,12 @@ void ShowClientResponse() {
     else {
       webpage += "<h1><br>Oops! Looks like there was something wrong with your input. Using default values...</h1>";
     }
-    webpage += "<p>New Feeding Time: " + clientTimeAsString + "</p>";
-    webpage += "<p>New Amount (quarter cups): " + clientAmountAsString + "</p>";
+    webpage += "<p>New Feeding Time: ";
+    webpage.concat(rawClientTime);
+    webpage += "</p>";
+    webpage += "<p>New Amount (quarter cups): ";
+    webpage.concat(rawClientAmount);
+    webpage += "</p>";
    webpage += "</body>";
   webpage += "</html>";
   server.send(200, "text/html", webpage);
@@ -245,8 +299,6 @@ String getUTCTime() {
       Serial.print("=====>");
     } else
     {
-      Serial.print("Result: " + line);
-      //  time starts at pos 14
       dateTime = line.substring(7, 24);
       Serial.println(dateTime);
     }
@@ -259,9 +311,9 @@ void updateDisplay(String timeString) {
   display.setCursor(0,0);
   display.setTextSize(1);
   display.setTextColor(WHITE);
-  display.println("Feeding Time: " + clientTimeAsString);
+  display.println("Feeding Time: " + String(rawClientTime));
   display.setCursor(0,15);
-  display.println("Amount: " + clientAmountAsString + ((clientAmountAsString.toInt() > 1) ? " cups" : " cup"));
+  display.println("Amount: " + String(rawClientAmount) + ((String(rawClientAmount).toInt() > 1) ? " q-cups" : " q-cup"));
   display.setCursor(0,40);
   display.println(WiFi.localIP());
   display.setCursor(0,55);
@@ -290,6 +342,52 @@ String convertUTCtoLocal(String nistTime) {
   return localTime;
 }
 
+
+void motorStop() {
+  digitalWrite( MOTOR_B_DIR, LOW );
+  digitalWrite( MOTOR_B_PWM, LOW );
+  delay( DIR_DELAY );
+}
+
+void motorForward() {
+  digitalWrite(MOTOR_B_DIR, HIGH);
+  analogWrite(MOTOR_B_PWM, 255-PWM_SPEED);
+}
+
+void dispenseQuarterCup() {
+  motorStop();
+  motorForward();
+  delay(MS_TO_DISPENSE_QUARTER_CUP);
+  motorStop();
+}
+
+unsigned int convertCArrayToInt(char array[]) {
+  char *pEnd;
+  unsigned int retVal;
+  retVal = strtol(array, &pEnd, 10);
+  return retVal;
+}
+
+void feed(unsigned int quarterCupsToFeed) {
+  blink();
+  for(int i = 0; i < quarterCupsToFeed; i++) {
+    dispenseQuarterCup();
+  }
+  requestDisplayUpdate = true;
+}
+
+bool isFeedingTime(String localTime) {
+  String timeNoSeconds = localTime.substring(0,5);
+  String clientTime = String(rawClientTime);
+  if(timeNoSeconds.equals(clientTime) && (millis() - lastFeedingTime > oneMinute)) {
+    Serial.println("FEEDING TIME!");
+    lastFeedingTime = millis();
+    return true;
+  }
+
+  return false;
+}
+
 void loop(){
   server.handleClient();
   unsigned long currentLoopTime = millis();
@@ -302,6 +400,10 @@ void loop(){
     Serial.println(host);
     String nistTime = getUTCTime();
     String localTime = convertUTCtoLocal(nistTime);
+    if(isFeedingTime(localTime)) {
+      unsigned int quarterCups = convertCArrayToInt(rawClientAmount);
+      feed(quarterCups);
+    }
     updateDisplay(localTime);
   }
 
