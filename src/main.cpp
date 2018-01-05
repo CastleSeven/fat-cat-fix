@@ -2,11 +2,10 @@
 #include <WiFiUdp.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <DNSServer.h>
 #include <Adafruit_ssd1306syp.h>
-#include <Wire.h>
 #include <EEPROM.h>
-#include <config.h>
+#include <ArduinoOTA.h>
+#include "config.h"
 
 #define EEPROM_SCHEMA 0xaa
 #define EEPROM_TIME_ADDR 1
@@ -104,6 +103,54 @@ void setup(){
     Serial.println("EEPROM Time: " + String(rawClientTime) + " EEPROM Amount: " + String(rawClientAmount));
   }
   EEPROM.end();
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else // U_SPIFFS
+      type = "filesystem";
+
+    // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+    display.clear();
+    display.setCursor(0,0);
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.println("OTA Update in Progress!");
+    display.setCursor(0,15);
+    display.println("Type: " + type);
+    display.update();
+    Serial.println("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    display.clear();
+    display.setCursor(0,0);
+    display.setTextSize(2);
+    display.setTextColor(WHITE);
+    display.println("Rebooting...");
+    display.update();
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    char buffer[100];
+    display.clear();
+    display.setCursor(0,0);
+    display.setTextSize(2);
+    display.setTextColor(WHITE);
+    snprintf(buffer, sizeof(buffer), "Progress: %u%%\r", (progress / (total / 100)));
+    display.println(buffer);
+    display.update();
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
 
   // Start the server
   server.begin();
@@ -389,6 +436,7 @@ bool isFeedingTime(String localTime) {
 }
 
 void loop(){
+  ArduinoOTA.handle();
   server.handleClient();
   unsigned long currentLoopTime = millis();
   if(currentLoopTime - previousLoopTime >= loopDelay || previousLoopTime == 0 || requestDisplayUpdate) {
