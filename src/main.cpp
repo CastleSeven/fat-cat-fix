@@ -7,7 +7,7 @@
 #include <ArduinoOTA.h>
 #include "config.h"
 
-#define EEPROM_SCHEMA 0xaa
+#define EEPROM_SCHEMA 0xab
 #define EEPROM_TIME_ADDR 1
 
 #define SDA_PIN D2
@@ -24,6 +24,7 @@
 
 #define DEFAULT_FEEDING_TIME "17:30"
 #define DEFAULT_FEEDING_AMOUNT "2"
+#define DEFAULT_DISPENSE_DELAY_MS "7000"
 
 
 const char* host = "time.nist.gov";
@@ -36,6 +37,7 @@ unsigned long lastFeedingTime = 0;
 String Argument_Name;
 char rawClientTime[] = DEFAULT_FEEDING_TIME;
 char rawClientAmount[] = DEFAULT_FEEDING_AMOUNT;
+char rawClientDelay[] = DEFAULT_DISPENSE_DELAY_MS;
 bool requestDisplayUpdate = true;
 
 ESP8266WebServer server(80);
@@ -91,6 +93,12 @@ void setup(){
       i++;
     } while(rawClientAmount[i - 1]);
 
+    i = 0;
+    do{
+      EEPROM.write(EEPROM_TIME_ADDR+sizeof(rawClientTime)+sizeof(rawClientAmount)+i, rawClientDelay[i]);
+      i++;
+    } while(rawClientDelay[i - 1]);
+
     EEPROM.commit();
   } else {
     for(int i = 0; i < sizeof(rawClientTime); i++) {
@@ -98,6 +106,9 @@ void setup(){
     }
     for(int i = 0; i < sizeof(rawClientAmount); i++) {
       rawClientAmount[i] = EEPROM.read(EEPROM_TIME_ADDR+sizeof(rawClientTime)+i);
+    }
+    for(int i = 0; i < sizeof(rawClientDelay); i++) {
+      rawClientDelay[i] = EEPROM.read(EEPROM_TIME_ADDR+sizeof(rawClientTime)+sizeof(rawClientAmount)+i);
     }
 
     Serial.println("EEPROM Time: " + String(rawClientTime) + " EEPROM Amount: " + String(rawClientAmount));
@@ -170,7 +181,10 @@ void storeEEPROMValues() {
   for(int i = 0; i < sizeof(rawClientAmount); i++) {
     EEPROM.write(EEPROM_TIME_ADDR+i+sizeof(rawClientTime), rawClientAmount[i]);
     Serial.println();
-
+  }
+  for(int i = 0; i < sizeof(rawClientDelay); i++) {
+    EEPROM.write(EEPROM_TIME_ADDR+i+sizeof(rawClientTime)+sizeof(rawClientAmount), rawClientDelay[i]);
+    Serial.println();
   }
   EEPROM.commit();
   EEPROM.end();
@@ -192,10 +206,13 @@ void HandleClient() {
     webpage += "<h2><br>Currently Set Feeding Amount (&frac14; cups): ";
     webpage.concat(rawClientAmount);
     webpage += "</h2>";
+    webpage += "<h2><br>Currently Set Feeding Delay (ms): ";
+    webpage.concat(rawClientDelay);
+    webpage += "</h2>";
     String IPaddress = WiFi.localIP().toString();
     webpage += "<form action='http://"+IPaddress+"/result' method='POST'>";
      webpage += "Feeding Time:<input type='text' name='time_input'><BR>";
-     webpage += "Amount to feed (in &frac14;, e.g., enter \"4\" to feed 4 quarters, or 1 cup):<input type='text' name='amount_input'>&nbsp;<input type='submit' value='Enter'>"; // omit <input type='submit' value='Enter'> for just 'enter'
+     webpage += "Amount to feed (in &frac14;, e.g., enter \"4\" to feed 4 quarters, or 1 cup):<input type='text' name='amount_input'><BR>Motor Delay(ms)<input type='text' name='delay_input'>&nbsp;<input type='submit' value='Enter'>"; // omit <input type='submit' value='Enter'> for just 'enter'
     webpage += "</form><BR><BR><BR>";
     webpage += "<form action='http://"+IPaddress+"/feednow' method='POST'><input type='submit' value='Feed Now!'></form>";
    webpage += "</body>";
@@ -213,6 +230,11 @@ bool validateClientInput() {
   if(rawClientAmount[0] == '0' || strlen(rawClientAmount) > 1 || !isdigit(rawClientAmount[0])) {
     Serial.println("Amount must be a non-zero integer from 1 - 9!");
     strcpy(rawClientAmount, DEFAULT_FEEDING_AMOUNT);
+    valid = false;
+  }
+  if(rawClientDelay[0] == '0' || strlen(rawClientDelay) != 4 || !isdigit(rawClientAmount[0])) {
+    Serial.println("Amount must be a 4 digit integer value!");
+    strcpy(rawClientAmount, DEFAULT_DISPENSE_DELAY_MS);
     valid = false;
   }
 
@@ -259,6 +281,13 @@ void ShowClientResponse() {
         // e.g. range_maximum = server.arg(i).toInt();   // use string.toInt()   if you wanted to convert the input to an integer number
         // e.g. range_maximum = server.arg(i).toFloat(); // use string.toFloat() if you wanted to convert the input to a floating point number
       }
+      if (server.argName(i) == "delay_input") {
+        Serial.print(" Input received was: ");
+        Serial.println(server.arg(i));
+        server.arg(i).toCharArray(rawClientDelay, sizeof(rawClientDelay));
+        // e.g. range_maximum = server.arg(i).toInt();   // use string.toInt()   if you wanted to convert the input to an integer number
+        // e.g. range_maximum = server.arg(i).toFloat(); // use string.toFloat() if you wanted to convert the input to a floating point number
+      }
     }
     validInput = validateClientInput();
     if(validInput) {
@@ -287,6 +316,9 @@ void ShowClientResponse() {
     webpage += "</p>";
     webpage += "<p>New Amount (quarter cups): ";
     webpage.concat(rawClientAmount);
+    webpage += "</p>";
+    webpage += "<p>New Delay (ms): ";
+    webpage.concat(rawClientDelay);
     webpage += "</p>";
    webpage += "</body>";
   webpage += "</html>";
@@ -402,9 +434,10 @@ void motorForward() {
 }
 
 void dispenseQuarterCup() {
+  unsigned int delayMS = convertCArrayToInt(rawClientDelay);
   motorStop();
   motorForward();
-  delay(MS_TO_DISPENSE_QUARTER_CUP);
+  delay(delayMS);
   motorStop();
 }
 
